@@ -1,0 +1,10 @@
+// common은 라이브러리 모듈이므로 bootJar를 생성하지 않는다
+jar {
+    enabled = true
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+}

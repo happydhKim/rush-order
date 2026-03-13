@@ -93,14 +93,16 @@
 ```text
 rush-order/
 ├── common/                     # 공통 모듈 (DTO, Exception, Utils)
-├── gateway/                    # API Gateway
+├── gateway/                    # API Gateway (JWT, Rate Limiting)
 ├── restaurant-service/         # 가게/메뉴 (CQRS)
 ├── order-service/              # 주문 (Saga + Outbox)
 ├── payment-service/            # 결제 (Resilience4j)
 ├── inventory-service/          # 재고 (Pessimistic Lock)
 ├── notification-service/       # 알림 (Kafka Consumer)
+├── infra/                      # 인프라 설정 (DB 초기화 스크립트 등)
 ├── docs/                       # 설계 문서
-├── docker-compose.yml          # 인프라 + 서비스
+├── docker-compose.yml          # 인프라 컨테이너
+├── settings.gradle             # 멀티모듈 설정
 └── build.gradle                # 루트 빌드 설정
 ```
 
