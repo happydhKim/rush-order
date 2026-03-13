@@ -1,0 +1,61 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway
+
+  cloud:
+    gateway:
+      routes:
+        - id: restaurant-service
+          uri: http://localhost:8082
+          predicates:
+            - Path=/api/restaurants/**
+
+        - id: order-service
+          uri: http://localhost:8083
+          predicates:
+            - Path=/api/orders/**
+
+        - id: payment-service
+          uri: http://localhost:8084
+          predicates:
+            - Path=/api/payments/**
+
+        - id: inventory-service
+          uri: http://localhost:8085
+          predicates:
+            - Path=/api/inventories/**
+
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin
+
+  # JWT 검증 (Keycloak)
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:9090/realms/rush-order
+
+  # Redis (Rate Limiting)
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, gateway
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
