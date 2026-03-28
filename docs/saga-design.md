@@ -68,6 +68,62 @@ public class SagaInstance {
 }
 ```
 
+## 구현 현황
+
+### SagaOrchestrator (Order Service)
+
+`SagaOrchestrator`가 전체 흐름을 중앙에서 관리한다:
+
+```java
+// 1. 주문 생성 직후 — 같은 TX에서 호출
+sagaOrchestrator.startSaga(order);
+  → SagaInstance 생성 (PAYMENT_REQUESTED)
+  → Order → PAYMENT_PROCESSING
+  → Outbox("payment-requested") 저장
+
+// 2. Outbox 폴링 → Kafka("payment-requested")
+
+// 3. Payment Service의 PaymentEventConsumer
+  → PaymentService.processPayment() (Resilience4j 적용)
+  → Kafka("payment-result") 발행
+
+// 4. Order Service의 PaymentResultConsumer
+  → sagaOrchestrator.handlePaymentResult(orderId, success, pgTxId)
+  → 성공: Inventory confirm(Feign) → Order CONFIRMED → Outbox("order-confirmed")
+  → 실패: Inventory release(Feign) → Order CANCELLED → Outbox("order-cancelled")
+  → 보상 실패(3회): Order COMPENSATION_FAILED → DLQ("order-compensation-dlq")
+```
+
+### SagaInstance 엔티티
+
+```java
+@Entity @Table(name = "saga_instances")
+public class SagaInstance {
+    private String sagaId;      // UUID PK
+    private String orderId;     // unique
+    private SagaStatus status;  // STARTED → PAYMENT_REQUESTED → COMPLETED/FAILED/COMPENSATION_FAILED
+    private String payload;     // 주문 정보 JSON
+    private int retryCount;     // 보상 재시도 횟수
+}
+```
+
+### 멱등성 보장
+
+- `handlePaymentResult()`에서 SagaInstance 상태 확인 — 이미 COMPLETED/FAILED면 무시
+- PaymentService의 idempotencyKey 기반 중복 결제 방지
+- Inventory release의 멱등성 — StockReservation 상태가 이미 RELEASED면 skip
+
+### Kafka 이벤트 플로우
+
+| 토픽 | 발행자 | 소비자 | 파티션 키 |
+| --- | --- | --- | --- |
+| order-created | Order Outbox | Notification | orderId |
+| payment-requested | Order Outbox | Payment | orderId |
+| payment-result | Payment | Order(Saga) | orderId |
+| order-confirmed | Order Outbox | Notification | orderId |
+| order-cancelled | Order Outbox | Notification | orderId |
+| order-compensation-dlq | Order(DLQ) | 수동 처리 | orderId |
+
 ## 동기/비동기 분리 전략
 
 ```text
@@ -95,3 +151,25 @@ Orchestrator가 죽으면 진행 중인 Saga가 멈춘다. 이것이 Orchestrati
 - Saga 상태를 DB(saga_instances 테이블)에 영구 저장한다. 재시작 시 `status != CONFIRMED && status != CANCELLED`인 Saga를 조회하여 마지막 상태부터 재개한다.
 - Saga 진행 중 Orchestrator가 죽어도, 재고 예약에는 TTL(5분)이 있으므로 무한정 잠기지 않는다.
 - 복수 인스턴스 운영 시 분산 락(Redis)으로 같은 Saga를 두 인스턴스가 동시에 재개하는 것을 방지한다.
+
+## 테스트 커버리지
+
+### SagaOrchestratorTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| startSaga | SagaInstance(PAYMENT_REQUESTED) 생성 + Order(PAYMENT_PROCESSING) 전이 + Outbox 저장 |
+| handlePaymentResult 성공 | Inventory confirm(Feign) → Order CONFIRMED → Outbox("order-confirmed") |
+| handlePaymentResult 실패 | Inventory release(Feign) → Order CANCELLED → Outbox("order-cancelled") |
+| 보상 3회 실패 | COMPENSATION_FAILED 상태 전이 + DLQ("order-compensation-dlq") 발행 |
+| 보상 1회 실패 | retryCount 증가만, DLQ 미발행 (3회 미만) |
+| 멱등성 (COMPLETED) | 이미 종료 상태면 재처리 무시 — At-least-once + 멱등성 = Exactly-once 효과 |
+
+### OrderStatusTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 허용된 상태 전이 7개 | PENDING→INVENTORY_RESERVED, CONFIRMED 등 모든 정방향 전이 |
+| 거부되는 상태 전이 | 최종 상태(CONFIRMED, CANCELLED, COMPENSATION_FAILED)에서의 전이 차단 |
+| ParameterizedTest | 모든 상태 조합을 ALLOWED_TRANSITIONS 맵과 대조 |
+| Order.transitionTo() 통합 | 정상 흐름, 보상 흐름, 보상 실패 흐름 시나리오 |

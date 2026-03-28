@@ -51,25 +51,47 @@ resilience4j:
         timeoutDuration: 3s            # 3초 타임아웃
 ```
 
-## Fallback 전략
+## Fallback 전략 — 구현 완료
 
 ```java
-@CircuitBreaker(name = "pgPayment", fallbackMethod = "fallbackPayment")
+// PaymentService.java
 @Retry(name = "pgPayment")
-@TimeLimiter(name = "pgPayment")
-public PaymentResult processExternalPayment(PaymentRequest request) {
-    return pgClient.approve(request);
+@CircuitBreaker(name = "pgPayment", fallbackMethod = "fallbackPayment")
+@Bulkhead(name = "pgPayment")
+@Transactional
+public PaymentResponse processPayment(PaymentRequest request) {
+    // 멱등성: 이미 처리된 결제가 있으면 기존 결과 반환
+    Optional<Payment> existing = paymentRepository
+        .findByIdempotencyKey(request.idempotencyKey());
+    if (existing.isPresent()) {
+        return PaymentResponse.from(existing.get());
+    }
+
+    // PG 승인 — 실패 시 예외가 전파되어 Retry/CircuitBreaker가 처리
+    String pgTransactionId = pgClient.approve(request.orderId(), request.amount());
+
+    Payment payment = new Payment(request.orderId(), request.idempotencyKey(), request.amount());
+    payment.approve(pgTransactionId);
+    paymentRepository.save(payment);
+    return PaymentResponse.from(payment);
 }
 
 /**
- * PG 장애 시 결제를 즉시 실패시키지 않고 지연 큐에 넣어
- * PG 복구 후 재시도한다.
+ * PG 장애 시 결제를 즉시 실패시키지 않고 PENDING 상태로 저장하여
+ * PG 복구 후 재처리할 수 있는 여지를 남긴다.
  */
-public PaymentResult fallbackPayment(PaymentRequest request, Exception e) {
-    delayedPaymentQueue.enqueue(request);
-    return PaymentResult.PENDING;
+public PaymentResponse fallbackPayment(PaymentRequest request, Exception e) {
+    Payment payment = new Payment(request.orderId(), request.idempotencyKey(), request.amount());
+    paymentRepository.save(payment);  // status = PENDING
+    return PaymentResponse.from(payment);
 }
 ```
+
+핵심 설계 결정: 기존 코드에서는 `PgPaymentException`을 `try-catch`로 잡아 `FAILED` 상태로 저장했으나, 이 경우 Retry/CircuitBreaker AOP 프록시가 예외를 감지하지 못해 재시도가 동작하지 않았다. 예외를 메서드 밖으로 전파하도록 수정하여 Resilience4j 데코레이터가 정상 동작하게 했다.
+
+### TimeLimiter 미적용 이유
+
+`@TimeLimiter`는 `CompletableFuture`를 반환하는 비동기 메서드에만 적용 가능하다. 현재 `processPayment`는 동기 메서드이므로 어노테이션 적용이 불가하다. `application.yml`에 설정만 유지하여 향후 비동기 전환 시 활용할 수 있도록 한다.
 
 ## Bulkhead
 
@@ -84,17 +106,43 @@ resilience4j:
         maxWaitDuration: 500ms         # 대기 최대 500ms
 ```
 
-## Rate Limiting (API Gateway)
+## Rate Limiting (API Gateway) — 구현 완료
 
-Redis 기반 Token Bucket 알고리즘으로 트래픽을 제어한다.
+Redis 기반 Token Bucket 알고리즘으로 트래픽을 제어한다. Spring Cloud Gateway의 `RequestRateLimiter` 필터 + `RedisRateLimiter`를 사용한다.
 
 ```text
-사용자별: 100 req/min
-IP별:    1000 req/min
-가게별:  5000 req/min (이벤트 시 동적 조절 가능)
+IP별: replenishRate=100, burstCapacity=120
 ```
 
+```yaml
+# gateway application.yml
+filters:
+  - name: RequestRateLimiter
+    args:
+      redis-rate-limiter.replenishRate: 100
+      redis-rate-limiter.burstCapacity: 120
+      key-resolver: "#{@ipKeyResolver}"
+```
+
+KeyResolver 구현:
+
+- `ipKeyResolver`: `X-Forwarded-For` 헤더 우선, 없으면 `remoteAddress` 사용
+- `userKeyResolver`: JWT principal에서 사용자 ID 추출 (선택적 사용)
+
+Token Bucket을 선택한 이유: `replenishRate`로 평균 속도를 제한하면서 `burstCapacity`로 순간 트래픽을 허용한다. Fixed Window 방식 대비 경계 시점(boundary) 문제가 없다.
+
 Rate Limit 초과 시 `429 Too Many Requests`를 반환한다.
+
+## Feign ErrorDecoder — 구현 완료
+
+Order Service → Inventory Service 간 Feign 통신에서 에러 응답을 적절한 비즈니스 예외로 변환한다.
+
+```text
+4xx 응답 → ApiResponse body 파싱 → BusinessException 변환 (INSUFFICIENT_STOCK 등)
+5xx 응답 → ServiceUnavailableException (503)
+```
+
+4xx와 5xx를 구분하는 이유: 4xx는 클라이언트 요청 문제(재고 부족 등)이므로 재시도해도 결과가 같다. 5xx는 일시적 장애일 수 있으므로 Retry/CircuitBreaker 대상이 된다.
 
 ## 장애 시나리오별 대응
 
@@ -125,3 +173,30 @@ Retry(CircuitBreaker(TimeLimiter(실제 호출)))
 이 순서의 의미: Retry가 가장 바깥에서 감싸므로, CircuitBreaker가 OPEN이면 Retry도 즉시 실패한다. 만약 반대로 CircuitBreaker(Retry(...))이면 Retry가 3번 재시도한 최종 결과만 Circuit Breaker에 기록된다. 이 경우 실제로는 9번 실패(3회 x 3회)했는데 Circuit Breaker는 3건만 인식하여 장애 감지가 느려진다.
 
 `spring.cloud.circuitbreaker.resilience4j.enableGroupMeterFilter`로 실행 순서를 커스텀할 수 있지만, 기본 순서가 대부분의 상황에 적합하다.
+
+## 테스트 커버리지
+
+### PaymentServiceTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 정상 결제 | PG 호출 → Payment(APPROVED) 저장 → PaymentResponse 반환 |
+| PG 실패 | PgPaymentException 전파 — AOP 프록시가 Retry/CB를 트리거하도록 catch하지 않음 |
+| 멱등성 (중복 idempotencyKey) | 기존 결과 반환, PG 재호출 없음 |
+| Fallback | PENDING 상태 저장 — PG 복구 후 재처리 가능 |
+
+### PaymentEventConsumerTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 정상 메시지 | processPayment + payment-result 발행 |
+| 결제 실패 | 실패 결과(success=false) 발행 — Saga 보상을 위해 반드시 발행 필요 |
+| JSON 파싱 실패 | 로그만 남기고 에러 전파하지 않음 |
+
+### FeignErrorDecoderTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 4xx (INSUFFICIENT_STOCK) | InsufficientStockException 변환 |
+| 4xx (NOT_FOUND) | NotFoundException 변환 |
+| 5xx | ServiceUnavailableException — Retry/CB 대상 |

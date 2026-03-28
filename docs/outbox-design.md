@@ -94,6 +94,37 @@ PostgreSQL WAL → Flink CDC Connector → Kafka
 - processed 플래그의 역할이 축소됨 (WAL 변경 자체를 읽으므로)
 ```
 
+## 구현 현황
+
+### Order Service Outbox
+
+`OutboxPublisher`가 1초 간격으로 미발행 이벤트를 폴링하여 Kafka로 발행한다. `eventType`을 Kafka 토픽명으로, `aggregateId`를 파티션 키로 사용하여 같은 주문의 이벤트 순서를 보장한다.
+
+발행하는 이벤트:
+
+- `order-created` — 주문 생성 시 (Notification 소비)
+- `payment-requested` — Saga 시작 시 (Payment 소비)
+- `order-confirmed` — 결제 성공 시 (Notification 소비)
+- `order-cancelled` — 보상 완료 시 (Notification 소비)
+
+### Restaurant Service Outbox
+
+Restaurant Service도 독립적인 Outbox를 운영한다 (별도 DB). 가게/메뉴 변경 시 `restaurant-updated` 이벤트를 발행하며, Restaurant Service의 Kafka Consumer가 이를 소비하여 Elasticsearch에 인덱싱한다 (CQRS 동기화).
+
+### Kafka 토픽 설정 (Spring Boot @Configuration)
+
+6개 토픽을 `NewTopic` Bean으로 명시적 생성한다 (파티션 3, 리플리카 1):
+
+```java
+@Bean
+public NewTopic orderCreatedTopic() {
+    return TopicBuilder.name("order-created")
+        .partitions(3).replicas(1).build();
+}
+```
+
+파티션 3개인 이유: 단일 브로커에서 Consumer 병렬 처리의 기본 단위. 같은 orderId의 이벤트는 해시로 같은 파티션에 배정되어 순서가 보장된다.
+
 ## Outbox 이벤트 정리 전략
 
 시간이 지나면 processed=true인 레코드가 누적된다:
@@ -115,3 +146,21 @@ PostgreSQL WAL → Flink CDC Connector → Kafka
 2. **트랜잭션 시간이 늘어난다**: Kafka 네트워크 왕복 시간만큼 DB 커넥션을 점유한다. 커넥션 풀 고갈 위험이 있다.
 
 Outbox는 "DB 커밋의 신뢰성"과 "메시지 발행의 비동기성"을 분리하는 것이 핵심이다.
+
+## 테스트 커버리지
+
+### OutboxPublisherTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 미발행 이벤트 폴링 | Kafka send 호출 + processed=true 업데이트 |
+| aggregateId 파티션 키 | Kafka send 시 aggregateId가 key로 사용되는지 검증 — 같은 주문 이벤트의 순서 보장 |
+| 미발행 이벤트 없음 | Kafka send 미호출 (불필요한 발행 방지) |
+| Kafka 발행 실패 | processed=false 유지 + 후속 이벤트 미처리 — At-least-once 보장의 핵심 |
+
+### OrderServiceTest — Outbox 원자성 검증
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 정상 주문 생성 | Order INSERT + Outbox INSERT가 같은 트랜잭션에서 실행 (Mockito InOrder 검증) |
+| 재고 부족 | 예외 발생 시 Order + Outbox 모두 미저장 (트랜잭션 롤백) |

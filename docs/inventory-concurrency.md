@@ -59,9 +59,9 @@ public void reserveStock(List<OrderItem> items) {
 }
 ```
 
-## 재시도 정책 (지수 백오프)
+## 재시도 정책 (지수 백오프) — 구현 완료
 
-락 경합으로 타임아웃이 발생하면 즉시 재시도하지 않고 점진적으로 대기 시간을 늘린다.
+락 경합으로 `PessimisticLockingFailureException`이 발생하면 Spring Retry의 `@Retryable`로 지수 백오프 재시도를 수행한다.
 
 ```text
 1차 재시도: 100ms 대기
@@ -70,23 +70,62 @@ public void reserveStock(List<OrderItem> items) {
 최대 3회, 이후 실패 반환
 ```
 
-## 재고 예약 TTL
+```java
+// InventoryService.java
+@Retryable(
+    retryFor = PessimisticLockingFailureException.class,
+    maxAttempts = 3,
+    backoff = @Backoff(delay = 100, multiplier = 2)
+)
+@Transactional
+public void reserveStock(StockReserveRequest request) {
+    // menuId 오름차순 정렬 → 비관적 락 획득 → 예약
+}
+```
+
+재시도는 새 트랜잭션에서 수행되므로 이전 트랜잭션의 락은 자동 해제된다.
+
+## 재고 예약 TTL — 구현 완료
 
 주문 접수 시 재고를 "예약"하고, 결제가 완료되면 확정한다. 결제가 일정 시간 내에 완료되지 않으면 예약을 자동 해제한다.
 
 ```text
 주문 접수 → 재고 예약 (reserved_until = now + 5분)
-결제 성공 → 재고 확정 (reserved_until = null, confirmed = true)
-5분 경과 → 스케줄러가 미확정 예약을 자동 해제
+결제 성공 → 재고 확정 (status = CONFIRMED)
+5분 경과 → 스케줄러가 미확정 예약을 자동 해제 (status = EXPIRED)
 ```
+
+### StockReservation 엔티티
+
+`Inventory`가 메뉴 단위의 총량을 관리한다면, `StockReservation`은 주문 단위의 개별 예약을 추적한다.
+
+```java
+@Entity
+@Table(name = "stock_reservations",
+       indexes = @Index(name = "idx_reservation_expired",
+                        columnList = "status, reserved_until"))
+public class StockReservation {
+    private Long menuId;
+    private String orderId;      // Order Service의 orderId (UUID)
+    private int quantity;
+    private LocalDateTime reservedAt;
+    private LocalDateTime reservedUntil;  // = reservedAt + 5분
+    private StockReservationStatus status; // RESERVED, CONFIRMED, RELEASED, EXPIRED
+}
+```
+
+### ReservationCleanupScheduler
 
 ```java
 @Scheduled(fixedDelay = 60000)  // 1분 간격
 public void releaseExpiredReservations() {
-    int released = inventoryRepository
-        .releaseExpiredReservations(LocalDateTime.now());
-    if (released > 0) {
-        log.info("Released {} expired reservations", released);
+    List<StockReservation> expired = stockReservationRepository
+        .findExpiredReservations(LocalDateTime.now());
+    for (StockReservation reservation : expired) {
+        Inventory inventory = inventoryRepository
+            .findByMenuIdForUpdate(reservation.getMenuId());  // 비관적 락
+        inventory.release(reservation.getQuantity());
+        reservation.expire();
     }
 }
 ```
@@ -98,11 +137,12 @@ public void releaseExpiredReservations() {
 @Table(name = "inventories")
 public class Inventory {
     @Id
-    private String menuId;
+    private Long menuId;
     private int totalStock;
     private int reservedStock;
 
-    public void decrease(int quantity) {
+    // 가용 재고 = totalStock - reservedStock
+    public void reserve(int quantity) {
         int available = totalStock - reservedStock;
         if (available < quantity) {
             throw new InsufficientStockException(menuId, available, quantity);
@@ -141,3 +181,41 @@ public class Inventory {
 - 실질적으로 처리하는 DB 작업량이 비관적 락의 2~3배에 달한다
 
 비관적 락은 대기 시간이 발생하지만, 한 번 락을 잡으면 확실히 성공한다. "대기 vs 롤백+재시도"의 트레이드오프에서, 충돌 빈도가 높은 이 도메인에서는 비관적 락이 전체 처리량에서 유리하다.
+
+## 테스트 커버리지
+
+### InventoryServiceTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 정상 재고 예약 | Inventory.reserve() + StockReservation 생성 |
+| 재고 부족 | InsufficientStockException 발생 |
+| menuId 오름차순 정렬 | InOrder 검증 — 데드락 방지 Lock Ordering 확인 |
+| confirmStock | StockReservation.confirm() + Inventory.confirm() |
+| releaseStock | StockReservation.release() + Inventory.release() |
+| 이미 RELEASED된 예약 해제 | skip (멱등성) — Saga 보상 재시도 시 안전 |
+| 이미 CONFIRMED된 예약 확정 | skip (멱등성) |
+
+### InventoryTest (도메인 단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| reserve | 재고 차감, 누적 예약, 부족 시 예외 |
+| confirm | totalStock/reservedStock 동시 차감 |
+| release | 예약 해제 + 가용 재고 복구 |
+
+### StockReservationTest (도메인 단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 생성 시 초기 상태 | status=RESERVED, reservedUntil = now + 5분 |
+| confirm/release/expire | 상태 전이 검증 |
+| isExpired() | TTL 만료 판단 로직 |
+
+### ReservationCleanupSchedulerTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 만료된 예약 해제 | release + EXPIRED 상태 변경 |
+| 만료된 예약 없음 | 아무것도 하지 않음 (no-op) |
+| 여러 건 동시 처리 | 배치 정리 동작 확인 |

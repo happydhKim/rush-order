@@ -12,21 +12,45 @@ spring:
           uri: http://localhost:8082
           predicates:
             - Path=/api/restaurants/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 120
+                key-resolver: "#{@ipKeyResolver}"
 
         - id: order-service
           uri: http://localhost:8083
           predicates:
             - Path=/api/orders/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 120
+                key-resolver: "#{@ipKeyResolver}"
 
         - id: payment-service
           uri: http://localhost:8084
           predicates:
             - Path=/api/payments/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 120
+                key-resolver: "#{@ipKeyResolver}"
 
         - id: inventory-service
           uri: http://localhost:8085
           predicates:
             - Path=/api/inventories/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 120
+                key-resolver: "#{@ipKeyResolver}"
 
       default-filters:
         - DedupeResponseHeader=Access-Control-Allow-Origin

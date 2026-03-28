@@ -11,6 +11,10 @@ dependencies {
     // Kafka (Saga 보상 트랜잭션 이벤트)
     implementation 'org.springframework.kafka:spring-kafka'
 
+    // Retry (비관적 락 충돌 시 지수 백오프 재시도)
+    implementation 'org.springframework.retry:spring-retry'
+    implementation 'org.springframework.boot:spring-boot-starter-aop'
+
     // Micrometer Tracing
     implementation 'io.micrometer:micrometer-tracing-bridge-brave'
     implementation 'io.zipkin.reporter2:zipkin-reporter-brave'

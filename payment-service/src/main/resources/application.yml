@@ -53,6 +53,7 @@ resilience4j:
         waitDuration: 500ms
         exponentialBackoffMultiplier: 2
         retryExceptions:
+          - com.rushorder.payment.client.PgClient$PgPaymentException
           - java.io.IOException
           - java.util.concurrent.TimeoutException
   timelimiter:

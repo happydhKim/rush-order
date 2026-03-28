@@ -61,13 +61,31 @@ public class IdempotencyService {
 }
 ```
 
-## 적용 위치
+## 적용 위치 — 구현 완료
 
-| 서비스 | 적용 대상 | 이유 |
-| --- | --- | --- |
-| Order Service | 주문 생성 API | 중복 주문 방지 |
-| Payment Service | 결제 처리 | 중복 결제 방지 |
-| Saga 보상 트랜잭션 | 재고 롤백 | 보상이 중복 실행되어도 안전하게 |
+| 서비스 | 적용 대상 | 멱등키 | 방식 |
+| --- | --- | --- | --- |
+| Order Service | 주문 생성 API | X-Idempotency-Key 헤더 (UUID) | Redis SET NX + DB unique |
+| Payment Service | 결제 처리 | orderId를 idempotencyKey로 사용 | DB unique constraint |
+| Notification Service | Kafka Consumer | `{topic}:{key}:{offset}` | DB unique (event_id) |
+| Saga Orchestrator | 결제 결과 처리 | SagaInstance 상태 확인 | 상태 기반 멱등성 |
+
+### Consumer 멱등성 (Notification Service)
+
+Kafka의 At-least-once 특성상 같은 메시지가 재전달될 수 있다. `eventId`를 `{topic}:{key}:{offset}` 조합으로 생성하고, DB unique constraint로 중복 처리를 방지한다.
+
+```java
+@KafkaListener(topics = "order-created")
+public void handleOrderCreated(ConsumerRecord<String, String> record) {
+    String eventId = record.topic() + ":" + record.key() + ":" + record.offset();
+    // 1차: existsByEventId() SELECT 체크
+    // 2차: DB unique constraint (TOCTOU 방어)
+}
+```
+
+### Saga 상태 기반 멱등성
+
+`handlePaymentResult()`에서 SagaInstance의 현재 상태를 확인한다. COMPLETED/FAILED/COMPENSATION_FAILED 같은 종료 상태면 재처리하지 않는다. Kafka 메시지 재전달 시 안전하게 무시된다.
 
 ## SET NX의 원자성
 
@@ -95,6 +113,7 @@ SET NX는 이것을 하나의 원자적 명령으로 해결한다.
 멱등키는 **클라이언트가 생성**한다. 서버가 생성하면 "같은 요청의 재시도"를 구분할 수 없다.
 
 클라이언트 구현 시:
+
 - 주문 화면 진입 시 UUID를 생성한다.
 - 같은 화면에서 재시도하면 동일한 UUID를 사용한다.
 - 새로운 주문 화면을 열면 새 UUID를 생성한다.
@@ -115,3 +134,30 @@ DB unique constraint만으로도 중복 방지는 가능하다. 하지만 대량
 - DB 조회는 네트워크 왕복 + 디스크 I/O가 필요하다. Redis SET NX는 인메모리 O(1)이다.
 - 점심시간 피크에 수천 건의 주문이 동시에 들어올 때, 모든 중복 체크를 DB에 위임하면 DB 커넥션 풀이 멱등키 확인만으로 소진될 수 있다.
 - Redis를 앞단에 두면 대부분의 중복 요청을 DB에 도달하기 전에 차단한다. DB는 Redis를 통과한 요청만 처리하므로 부하가 줄어든다.
+
+## 테스트 커버리지
+
+### IdempotencyServiceTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| SET NX 성공 (새 키) | isDuplicate → false, Redis에 "PROCESSING" + TTL 24h 저장 |
+| SET NX 실패 (중복 키) | isDuplicate → true, 재처리 방지 |
+| SET NX null 결과 | isDuplicate → true — 안전한 쪽으로 처리 (defensive) |
+| Redis 장애 시 | isDuplicate → false — DB unique constraint에 위임 (Fail-open with fallback) |
+| cacheResponse/getCachedResponse | 정상 캐싱 및 조회 + Redis 장애 시 graceful 처리 |
+
+### NotificationServiceTest — Consumer 멱등성
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 정상 알림 생성 | eventId로 저장 + 발송 → SENT 상태 |
+| 중복 eventId (1차 방어) | existsByEventId() SELECT → 저장하지 않고 리턴 |
+| DB unique constraint (2차 방어) | DataIntegrityViolationException catch — TOCTOU 방어 |
+| eventId 구성 | `{topic}:{key}:{offset}` — Kafka At-least-once 특성에 맞춘 고유 식별자 |
+
+### PaymentServiceTest — 결제 멱등성
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 동일 idempotencyKey | 기존 결제 결과 반환, PG 재호출 없음 |

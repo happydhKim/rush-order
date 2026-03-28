@@ -78,6 +78,50 @@ ES 장애:
   검색 → 제한된 기능 (PG LIKE 기반, 품질 저하)
 ```
 
+## 구현 현황
+
+### Write Path — Outbox 이벤트 발행
+
+Restaurant Service의 쓰기 작업(생성, 수정, 메뉴 추가/수정) 시 같은 트랜잭션에서 Outbox 이벤트를 저장한다. Outbox 폴링 워커가 `restaurant-updated` 토픽으로 Kafka에 발행한다.
+
+```java
+// RestaurantService.java — 비즈니스 데이터 + Outbox 이벤트를 같은 TX에서 저장
+@Transactional
+public RestaurantResponse createRestaurant(RestaurantRequest request) {
+    Restaurant restaurant = new Restaurant(...);
+    restaurantRepository.save(restaurant);
+    saveOutboxEvent(restaurant);  // 같은 TX
+    return RestaurantResponse.from(restaurant);
+}
+```
+
+### Sync Path — Kafka Consumer → ES 인덱싱
+
+`RestaurantEventConsumer`가 `restaurant-updated` 토픽을 구독하여 `RestaurantDocument`로 변환 후 ES에 인덱싱한다.
+
+### Read Path — 3단계 Fallback
+
+`RestaurantSearchService`가 검색 요청을 처리한다:
+
+```text
+1. Redis 캐시 히트 → 즉시 반환 (TTL 5분)
+2. ES 검색 → 결과를 Redis에 캐싱 후 반환
+3. ES 장애 시 → PG 직접 쿼리 (fallback)
+```
+
+### ES Document 설계
+
+`RestaurantDocument`는 가게 정보와 메뉴 목록을 하나의 ES 문서로 관리한다. 메뉴는 Nested 타입으로 저장하여 cross-matching 문제를 방지한다 (Object 타입은 배열 요소가 flat하게 저장되어 메뉴A의 가격과 메뉴B의 이름이 매칭될 수 있다).
+
+### 검색 API
+
+| 엔드포인트 | 설명 |
+| --- | --- |
+| `GET /api/restaurants/search/keyword?q=&cursor=&size=` | Nori 기반 키워드 검색 (가게명 + 메뉴명) |
+| `GET /api/restaurants/search/category?category=&cursor=&size=` | 카테고리 필터 |
+| `GET /api/restaurants/search/nearby?lat=&lon=&distance=&cursor=&size=` | 위치 기반 검색 (geo_distance) |
+| `GET /api/restaurants/search/{restaurantId}` | 상세 조회 (Redis → ES → PG fallback) |
+
 ## 키셋 페이징 (Cursor-based Pagination)
 
 ```sql
@@ -119,3 +163,28 @@ ES가 죽으면 검색 기능이 멈추지만, 서비스 전체가 멈추면 안
 3. 검색 → PG의 `ILIKE` 기반으로 제한된 검색을 제공한다. 형태소 분석이 안 되므로 품질은 저하되지만, "검색 불가"보다는 낫다.
 
 Circuit Breaker를 ES 호출에 적용하여, ES 장애 감지 시 자동으로 fallback 경로로 전환한다.
+
+## 테스트 커버리지
+
+### RestaurantSearchServiceTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 키워드 검색 정상 | ES 조회 → RestaurantSearchResponse 반환 |
+| Redis 캐시 히트 | ES 미호출 — 캐시에서 직접 반환 |
+| Redis 장애 | ES 직접 조회 (fallback 1단계) |
+| ES 장애 | PG fallback (fallback 2단계) — ILIKE 기반 제한 검색 |
+
+### RestaurantServiceTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| 가게 등록 | Restaurant 저장 + Outbox("restaurant-updated") 저장 — CQRS 동기화 |
+| 메뉴 추가 | Menu 저장 + Outbox 이벤트 |
+| 가게 조회 | 정상/NotFound |
+
+### RestaurantEventConsumerTest (단위 테스트)
+
+| 테스트 케이스 | 검증 내용 |
+| --- | --- |
+| restaurant-updated | Kafka 메시지 수신 → ES 인덱싱 |
